@@ -5,6 +5,7 @@
 - 기본 3초 간격 새 글 감시
 - 게시글 본문 이미지/직접 첨부 영상 다운로드
 - 외부 링크는 1단계까지만 열어 이미지 수집
+- Google Drive 공개 이미지/영상 파일 링크 자동 다운로드
 - 이미지 중복 제거 없음
 - 영상 중복 제거 없음
 """
@@ -17,10 +18,13 @@ import signal
 import socket
 import sys
 import time
+import tempfile
+import shutil
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
+import gdown
 from bs4 import BeautifulSoup
 
 
@@ -151,7 +155,8 @@ def download_image(
     post_budget: list[int],
     index: int,
 ) -> bool:
-    """이미지를 저장한다. 중복 검사는 하지 않는다."""
+    """이미지를 임시 파일에 받은 뒤 성공한 경우에만 작성자 폴더를 만든다."""
+    temp_path = None
     try:
         with session.get(
             image_url,
@@ -170,20 +175,21 @@ def download_image(
                 logger.info("이미지 용량 제한 초과 - 건너뜀")
                 return False
 
-            # 이미지 URL/원본 파일명에 게시글 번호가 포함되는 경우가 있어
-            # 이미지 파일명은 URL의 이름을 사용하지 않고 중립적인 이름으로 저장한다.
-            # 작성자 폴더 아래 image_001.jpg, image_002.jpg ... 형태가 된다.
             raw_name = unquote(os.path.basename(urlparse(resp.url).path))
             ext = Path(raw_name).suffix.lower()
             if ext not in IMAGE_EXTENSIONS:
                 ext = extension_from_content_type(content_type)
             raw_name = f"image_{index:03d}{ext}"
 
-            # 실제로 저장할 이미지가 확인된 시점에만 작성자 폴더를 생성한다.
-            save_dir.mkdir(parents=True, exist_ok=True)
-            path = unique_path(save_dir, raw_name)
+            # 작성자 폴더 밖의 임시 위치에 먼저 저장한다.
+            tmp_dir = DOWNLOADS_DIR / ".tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix="img_", suffix=".part", dir=tmp_dir)
+            os.close(fd)
+            temp_path = Path(tmp_name)
+
             written = 0
-            with path.open("wb") as f:
+            with temp_path.open("wb") as f:
                 for chunk in resp.iter_content(chunk_size=1024 * 1024):
                     if not chunk:
                         continue
@@ -192,21 +198,31 @@ def download_image(
                         raise ValueError("이미지 또는 게시글 다운로드 용량 제한 초과")
                     f.write(chunk)
 
+        if written <= 0:
+            return False
+
+        # 다운로드 성공 후에만 작성자 폴더 생성 및 최종 이동.
+        save_dir.mkdir(parents=True, exist_ok=True)
+        final_path = unique_path(save_dir, raw_name)
+        shutil.move(str(temp_path), str(final_path))
+        temp_path = None
         post_budget[0] += written
         logger.info("새 이미지 저장")
         return True
-    except (requests.RequestException, OSError, ValueError) as exc:
-        try:
-            if "path" in locals() and path.exists():
-                path.unlink()
-        except OSError:
-            pass
+    except (requests.RequestException, OSError, ValueError):
         logger.warning("이미지 다운로드 실패")
         return False
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def download_video(video_url: str, referer: str, save_dir: Path, post_budget: list[int], index: int) -> bool:
-    """영상은 요청대로 SHA/URL 중복 검사를 하지 않는다."""
+    """영상을 임시 파일에 받은 뒤 성공한 경우에만 작성자 폴더를 만든다."""
+    temp_path = None
     try:
         with session.get(
             video_url,
@@ -224,11 +240,14 @@ def download_video(video_url: str, referer: str, save_dir: Path, post_budget: li
             if Path(raw_name).suffix.lower() not in VIDEO_EXTENSIONS:
                 raw_name = f"video_{index:03d}.mp4"
 
-            # 실제로 저장할 영상이 확인된 시점에만 작성자 폴더를 생성한다.
-            save_dir.mkdir(parents=True, exist_ok=True)
-            path = unique_path(save_dir, raw_name)
+            tmp_dir = DOWNLOADS_DIR / ".tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix="vid_", suffix=".part", dir=tmp_dir)
+            os.close(fd)
+            temp_path = Path(tmp_name)
+
             written = 0
-            with path.open("wb") as f:
+            with temp_path.open("wb") as f:
                 for chunk in resp.iter_content(chunk_size=1024 * 1024):
                     if not chunk:
                         continue
@@ -237,17 +256,159 @@ def download_video(video_url: str, referer: str, save_dir: Path, post_budget: li
                         raise ValueError("게시글 다운로드 용량 제한 초과")
                     f.write(chunk)
 
+        if written <= 0:
+            return False
+
+        save_dir.mkdir(parents=True, exist_ok=True)
+        final_path = unique_path(save_dir, raw_name)
+        shutil.move(str(temp_path), str(final_path))
+        temp_path = None
         post_budget[0] += written
         logger.info("새 영상 저장")
         return True
-    except (requests.RequestException, OSError, ValueError) as exc:
-        try:
-            if "path" in locals() and path.exists():
-                path.unlink()
-        except OSError:
-            pass
+    except (requests.RequestException, OSError, ValueError):
         logger.warning("영상 다운로드 실패")
         return False
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+
+
+def extract_google_drive_file_id(url: str) -> str | None:
+    """공개 Google Drive 단일 파일 링크에서 파일 ID를 추출한다.
+
+    지원 예:
+    - https://drive.google.com/file/d/<ID>/view
+    - https://drive.google.com/open?id=<ID>
+    - https://drive.google.com/uc?id=<ID>&export=download
+    - https://drive.usercontent.google.com/download?id=<ID>
+
+    폴더 링크는 의도적으로 지원하지 않는다.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in {"drive.google.com", "drive.usercontent.google.com"}:
+        return None
+
+    if "/drive/folders/" in parsed.path or "/folders/" in parsed.path:
+        return None
+
+    match = re.search(r"/file/d/([A-Za-z0-9_-]+)", parsed.path)
+    if match:
+        return match.group(1)
+
+    from urllib.parse import parse_qs
+    file_id = parse_qs(parsed.query).get("id", [None])[0]
+    if file_id and re.fullmatch(r"[A-Za-z0-9_-]+", file_id):
+        return file_id
+    return None
+
+
+def sniff_media_extension(path: Path) -> tuple[str | None, str | None]:
+    """파일 시그니처로 이미지/영상 종류를 판별한다.
+
+    반환값: ("image" | "video" | None, 확장자 | None)
+    """
+    try:
+        with path.open("rb") as f:
+            head = f.read(64)
+    except OSError:
+        return None, None
+
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image", ".jpg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image", ".png"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image", ".gif"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image", ".webp"
+    if head.startswith(b"BM"):
+        return "image", ".bmp"
+
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"AVI ":
+        return "video", ".avi"
+    if head.startswith(b"\x1aE\xdf\xa3"):
+        # WebM과 Matroska는 같은 EBML 헤더를 사용하므로 일반적인 웹 업로드 기준 .webm 사용.
+        return "video", ".webm"
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        major_brand = head[8:12]
+        if major_brand in {b"qt  ", b"M4V ", b"M4VH", b"M4VP"}:
+            return "video", ".mov" if major_brand == b"qt  " else ".m4v"
+        return "video", ".mp4"
+
+    return None, None
+
+
+def download_google_drive_media(
+    drive_url: str,
+    save_dir: Path,
+    post_budget: list[int],
+    image_index: int,
+    video_index: int,
+) -> tuple[bool, str | None]:
+    """공개 Google Drive 단일 파일을 받아 이미지/영상일 때만 저장한다.
+
+    로그인이나 별도 권한이 필요한 파일은 실패 처리한다.
+    작성자 폴더는 실제 저장 성공 시에만 생성된다.
+    """
+    file_id = extract_google_drive_file_id(drive_url)
+    if not file_id:
+        return False, None
+
+    tmp_dir = DOWNLOADS_DIR / ".tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix="gdrive_", suffix=".part", dir=tmp_dir)
+    os.close(fd)
+    temp_path = Path(tmp_name)
+
+    try:
+        # gdown은 공개 파일의 Google Drive 확인/리디렉션 페이지를 처리한다.
+        result = gdown.download(
+            id=file_id,
+            output=str(temp_path),
+            quiet=True,
+        )
+        if not result or not temp_path.exists():
+            logger.warning("Google Drive 공개 파일 다운로드 실패")
+            return False, None
+
+        size = temp_path.stat().st_size
+        if size <= 0 or post_budget[0] + size > MAX_POST_BYTES:
+            logger.info("Google Drive 파일 용량 제한 초과 - 건너뜀")
+            return False, None
+
+        media_type, ext = sniff_media_extension(temp_path)
+        if media_type == "image":
+            if size > MAX_IMAGE_BYTES:
+                logger.info("Google Drive 이미지 용량 제한 초과 - 건너뜀")
+                return False, None
+            filename = f"image_{image_index:03d}{ext}"
+        elif media_type == "video":
+            filename = f"video_{video_index:03d}{ext}"
+        else:
+            logger.info("Google Drive 링크가 지원 이미지/영상 파일이 아님 - 건너뜀")
+            return False, None
+
+        save_dir.mkdir(parents=True, exist_ok=True)
+        final_path = unique_path(save_dir, filename)
+        shutil.move(str(temp_path), str(final_path))
+        post_budget[0] += size
+        logger.info("Google Drive 공개 미디어 저장")
+        return True, media_type
+    except Exception:
+        logger.warning("Google Drive 공개 파일 처리 실패")
+        return False, None
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def collect_external_page_images(page_url: str, post_url: str) -> list[str]:
@@ -308,6 +469,7 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
     image_urls: list[str] = []
     video_urls: list[str] = []
     external_links: list[str] = []
+    google_drive_links: list[str] = []
 
     for tag in content.find_all("img"):
         src = tag.get("data-original") or tag.get("data-src") or tag.get("data-lazy-src") or tag.get("src")
@@ -329,7 +491,10 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
         if parsed.scheme not in ("http", "https"):
             continue
         ext = Path(parsed.path).suffix.lower()
-        if ext in IMAGE_EXTENSIONS:
+        drive_file_id = extract_google_drive_file_id(full)
+        if drive_file_id:
+            google_drive_links.append(full)
+        elif ext in IMAGE_EXTENSIONS:
             image_urls.append(full)
         elif ext in VIDEO_EXTENSIONS:
             video_urls.append(full)
@@ -349,10 +514,32 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
         if post_budget[0] >= MAX_POST_BYTES:
             break
 
+    next_video_index = 1
     if post_budget[0] < MAX_POST_BYTES:
         for video_index, video_url in enumerate(video_urls, start=1):
             if download_video(video_url, post_url, media_save_dir, post_budget, video_index):
                 video_saved += 1
+            next_video_index = video_index + 1
+            if post_budget[0] >= MAX_POST_BYTES:
+                break
+
+    # Google Drive 공개 단일 파일 링크를 이미지/영상으로 직접 다운로드한다.
+    # 폴더 링크와 로그인/권한이 필요한 파일은 건너뛴다.
+    if post_budget[0] < MAX_POST_BYTES:
+        for drive_url in google_drive_links[:MAX_EXTERNAL_LINKS_PER_POST]:
+            saved, media_type = download_google_drive_media(
+                drive_url,
+                media_save_dir,
+                post_budget,
+                image_index,
+                next_video_index,
+            )
+            if saved and media_type == "image":
+                image_saved += 1
+                image_index += 1
+            elif saved and media_type == "video":
+                video_saved += 1
+                next_video_index += 1
             if post_budget[0] >= MAX_POST_BYTES:
                 break
 
@@ -377,11 +564,30 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
 
 
 def parse_posts(html: str):
+    """게시글 행을 파싱한다. 디시의 class 순서/추가 class 변화에도 대응한다."""
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", class_="gall_list")
-    if not table or not table.find("tbody"):
+    if not table:
         return []
-    return table.find("tbody").find_all("tr", class_="ub-content us-post")
+    tbody = table.find("tbody")
+    if not tbody:
+        return []
+
+    # 우선 CSS selector로 두 class를 모두 가진 일반 게시글을 찾는다.
+    rows = tbody.select("tr.ub-content.us-post")
+    if rows:
+        return rows
+
+    # fallback: gall_num이 숫자인 ub-content 행을 사용한다.
+    fallback = []
+    for row in tbody.find_all("tr"):
+        classes = set(row.get("class") or [])
+        if "ub-content" not in classes:
+            continue
+        num_cell = row.find("td", class_="gall_num")
+        if num_cell and num_cell.get_text(strip=True).isdecimal():
+            fallback.append(row)
+    return fallback
 
 
 def post_matches(title: str, author: str) -> bool:
@@ -434,14 +640,15 @@ def main() -> int:
     rows = parse_posts(html)
     recent = newest_post_id(rows)
     if not recent:
-        logger.error("초기 최신 글 번호를 찾지 못했습니다.")
+        logger.error("초기 최신 글 번호를 찾지 못했습니다. 게시판 파싱에 실패했을 수 있습니다.")
         return 1
 
-    logger.info("감시 시작 (주기 %.1f초)", POLL_SECONDS)
+    logger.info("감시 시작 (주기 %.1f초, 초기 게시글 %d개 확인)", POLL_SECONDS, len(rows))
     logger.info("이번 실행 예정 시간: %.1f분", MONITOR_SECONDS / 60)
 
     started = time.monotonic()
     server_error_count = 0
+    last_heartbeat = started
 
     while not STOP_REQUESTED and time.monotonic() - started < MONITOR_SECONDS:
         loop_started = time.monotonic()
@@ -459,6 +666,16 @@ def main() -> int:
         server_error_count = 0
 
         rows = parse_posts(html)
+        if not rows:
+            logger.warning("게시글 목록 파싱 결과가 비어 있습니다. 다음 주기에 다시 시도합니다.")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        now = time.monotonic()
+        if now - last_heartbeat >= 60:
+            logger.info("감시 정상 동작 중")
+            last_heartbeat = now
+
         highest_seen = recent
         for row in reversed(rows):
             if STOP_REQUESTED:
@@ -504,6 +721,13 @@ def main() -> int:
         stop_at = time.monotonic() + sleep_for
         while not STOP_REQUESTED and time.monotonic() < stop_at:
             time.sleep(min(0.25, stop_at - time.monotonic()))
+
+    try:
+        tmp_dir = DOWNLOADS_DIR / ".tmp"
+        if tmp_dir.exists() and not any(tmp_dir.iterdir()):
+            tmp_dir.rmdir()
+    except OSError:
+        pass
 
     if STOP_REQUESTED:
         logger.info("감시를 중지합니다.")
