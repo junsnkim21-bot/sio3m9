@@ -179,6 +179,8 @@ def download_image(
                 ext = extension_from_content_type(content_type)
             raw_name = f"image_{index:03d}{ext}"
 
+            # 실제로 저장할 이미지가 확인된 시점에만 작성자 폴더를 생성한다.
+            save_dir.mkdir(parents=True, exist_ok=True)
             path = unique_path(save_dir, raw_name)
             written = 0
             with path.open("wb") as f:
@@ -222,6 +224,8 @@ def download_video(video_url: str, referer: str, save_dir: Path, post_budget: li
             if Path(raw_name).suffix.lower() not in VIDEO_EXTENSIONS:
                 raw_name = f"video_{index:03d}.mp4"
 
+            # 실제로 저장할 영상이 확인된 시점에만 작성자 폴더를 생성한다.
+            save_dir.mkdir(parents=True, exist_ok=True)
             path = unique_path(save_dir, raw_name)
             written = 0
             with path.open("wb") as f:
@@ -297,10 +301,9 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
     )
 
     safe_author = safe_filename(str(author), "Unknown")
-    # 이미지와 영상을 모두 작성자 폴더에 바로 저장한다.
+    # 이미지/영상이 실제로 저장될 때만 작성자 폴더를 만든다.
     # 구조: downloads/<gallery_id>/<author>/<media files>
     media_save_dir = DOWNLOADS_DIR / gallery_id / safe_author
-    media_save_dir.mkdir(parents=True, exist_ok=True)
 
     image_urls: list[str] = []
     video_urls: list[str] = []
