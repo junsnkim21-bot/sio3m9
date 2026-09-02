@@ -6,7 +6,7 @@ on:
       gallery_url:
         description: '감시할 디시인사이드 갤러리 URL'
         required: true
-        default: 'https://gall.dcinside.com/mgallery/board/lists?id=aoegame'
+        default: 'https://gall.dcinside.com/mgallery/board/lists?id=boobs'
         type: string
       keywords:
         description: '키워드(쉼표로 구분, 비우면 모든 새 글)'
@@ -56,27 +56,12 @@ jobs:
           sudo apt-get update -qq >/dev/null
           sudo apt-get install -y -qq p7zip-full >/dev/null
 
-      - name: Restore image hash database
-        uses: actions/cache/restore@v4
-        with:
-          path: data/image_hashes.txt
-          key: dc-image-hashes-${{ github.run_id }}
-          restore-keys: |
-            dc-image-hashes-
-
       - name: Run monitor
         env:
           GALLERY_URL: ${{ inputs.gallery_url }}
           KEYWORDS: ${{ inputs.keywords }}
           FILTER_FIELD: ${{ inputs.filter_field }}
         run: python monitor.py
-
-      - name: Save image hash database
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: data/image_hashes.txt
-          key: dc-image-hashes-${{ github.run_id }}
 
       - name: Create encrypted archive
         if: always()
