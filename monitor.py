@@ -5,12 +5,10 @@
 - 기본 3초 간격 새 글 감시
 - 게시글 본문 이미지/직접 첨부 영상 다운로드
 - 외부 링크는 1단계까지만 열어 이미지 수집
-- 이미지는 SHA-256 기준으로 실행 간 중복 제거
-- 영상은 중복 검사하지 않음
-- GitHub Actions Cache의 data/image_hashes.txt 로 이미지 해시를 이어서 사용
+- 이미지 중복 제거 없음
+- 영상 중복 제거 없음
 """
 
-import hashlib
 import ipaddress
 import logging
 import os
@@ -44,9 +42,7 @@ HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "10"))
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".avi", ".mkv", ".m4v")
-DATA_DIR = Path("data")
 DOWNLOADS_DIR = Path("downloads")
-HASH_FILE = DATA_DIR / "image_hashes.txt"
 
 
 logging.basicConfig(
@@ -89,43 +85,6 @@ def parse_gallery_url(url: str):
         raise ValueError("지원하지 않는 디시인사이드 갤러리 주소입니다.")
     return match.group("gallery_type"), match.group("gallery_id")
 
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def load_image_hashes() -> set[str]:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    hashes: set[str] = set()
-
-    if HASH_FILE.exists():
-        for line in HASH_FILE.read_text(encoding="utf-8").splitlines():
-            value = line.strip().lower()
-            if re.fullmatch(r"[0-9a-f]{64}", value):
-                hashes.add(value)
-
-    # 현재 downloads 폴더에 실제로 존재하는 이미지도 함께 검사한다.
-    if DOWNLOADS_DIR.is_dir():
-        for path in DOWNLOADS_DIR.rglob("*"):
-            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
-                try:
-                    hashes.add(sha256_file(path))
-                except OSError:
-                    logger.warning("기존 이미지 해시 계산 실패")
-
-    logger.info("중복 이미지 기록 로드 완료 (%d개)", len(hashes))
-    return hashes
-
-
-def save_image_hashes(hashes: set[str]) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = HASH_FILE.with_suffix(".tmp")
-    tmp.write_text("\n".join(sorted(hashes)) + ("\n" if hashes else ""), encoding="utf-8")
-    tmp.replace(HASH_FILE)
 
 
 def is_public_http_url(url: str) -> bool:
@@ -189,11 +148,10 @@ def download_image(
     image_url: str,
     referer: str,
     save_dir: Path,
-    image_hashes: set[str],
     post_budget: list[int],
     index: int,
 ) -> bool:
-    """이미지 저장. 동일 SHA-256이면 새 파일을 삭제한다."""
+    """이미지를 저장한다. 중복 검사는 하지 않는다."""
     try:
         with session.get(
             image_url,
@@ -232,14 +190,6 @@ def download_image(
                         raise ValueError("이미지 또는 게시글 다운로드 용량 제한 초과")
                     f.write(chunk)
 
-        image_hash = sha256_file(path)
-        if image_hash in image_hashes:
-            path.unlink(missing_ok=True)
-            logger.info("중복 이미지 제외")
-            return False
-
-        image_hashes.add(image_hash)
-        save_image_hashes(image_hashes)
         post_budget[0] += written
         logger.info("새 이미지 저장")
         return True
@@ -333,7 +283,7 @@ def collect_external_page_images(page_url: str, post_url: str) -> list[str]:
     return found
 
 
-def download_post_media(post_url: str, gallery_id: str, post_id: int, author: str, image_hashes: set[str]):
+def download_post_media(post_url: str, gallery_id: str, post_id: int, author: str):
     html = get_html(post_url)
     if not html:
         return
@@ -385,16 +335,14 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
         elif parsed.netloc and "dcinside.com" not in parsed.netloc.lower():
             external_links.append(full)
 
-    # URL 자체는 중복 판정 기준으로 쓰지 않는다.
-    # 같은 URL이 HTML에 여러 번 나타나도 그대로 시도할 수 있으며,
-    # 이미지 중복 여부는 오직 다운로드 후 SHA-256으로 결정한다.
+    # 이미지 중복 제거는 하지 않는다. 같은 이미지가 다시 나타나도 그대로 저장한다.
     post_budget = [0]
     image_saved = 0
     video_saved = 0
     image_index = 1
 
     for image_url in image_urls:
-        if download_image(image_url, post_url, image_save_dir, image_hashes, post_budget, image_index):
+        if download_image(image_url, post_url, image_save_dir, post_budget, image_index):
             image_saved += 1
         image_index += 1
         if post_budget[0] >= MAX_POST_BYTES:
@@ -411,7 +359,7 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
     if post_budget[0] < MAX_POST_BYTES:
         for external_url in external_links[:MAX_EXTERNAL_LINKS_PER_POST]:
             for image_url in collect_external_page_images(external_url, post_url):
-                if download_image(image_url, external_url, image_save_dir, image_hashes, post_budget, image_index):
+                if download_image(image_url, external_url, image_save_dir, post_budget, image_index):
                     image_saved += 1
                 image_index += 1
                 if post_budget[0] >= MAX_POST_BYTES:
@@ -477,95 +425,90 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _request_stop)
 
     gallery_type, gallery_id = parse_gallery_url(GALLERY_URL)
-    image_hashes = load_image_hashes()
+    html = get_html(GALLERY_URL)
+    if not html:
+        logger.error("초기 갤러리 페이지를 불러오지 못했습니다.")
+        return 1
 
-    try:
+    rows = parse_posts(html)
+    recent = newest_post_id(rows)
+    if not recent:
+        logger.error("초기 최신 글 번호를 찾지 못했습니다.")
+        return 1
+
+    logger.info("감시 시작 (주기 %.1f초)", POLL_SECONDS)
+    logger.info("이번 실행 예정 시간: %.1f분", MONITOR_SECONDS / 60)
+
+    started = time.monotonic()
+    server_error_count = 0
+
+    while not STOP_REQUESTED and time.monotonic() - started < MONITOR_SECONDS:
+        loop_started = time.monotonic()
         html = get_html(GALLERY_URL)
         if not html:
-            logger.error("초기 갤러리 페이지를 불러오지 못했습니다.")
-            return 1
-
-        rows = parse_posts(html)
-        recent = newest_post_id(rows)
-        if not recent:
-            logger.error("초기 최신 글 번호를 찾지 못했습니다.")
-            return 1
-
-        logger.info("감시 시작 (주기 %.1f초)", POLL_SECONDS)
-        logger.info("이번 실행 예정 시간: %.1f분", MONITOR_SECONDS / 60)
-
-        started = time.monotonic()
-        server_error_count = 0
-
-        while not STOP_REQUESTED and time.monotonic() - started < MONITOR_SECONDS:
-            loop_started = time.monotonic()
-            html = get_html(GALLERY_URL)
-            if not html:
-                server_error_count += 1
-                wait_seconds = 10 if server_error_count >= 3 else POLL_SECONDS
-                if server_error_count >= 3:
-                    logger.warning("연속 요청 실패. 잠시 후 계속합니다.")
-                    server_error_count = 0
-                stop_at = time.monotonic() + wait_seconds
-                while not STOP_REQUESTED and time.monotonic() < stop_at:
-                    time.sleep(min(0.25, stop_at - time.monotonic()))
-                continue
-            server_error_count = 0
-
-            rows = parse_posts(html)
-            highest_seen = recent
-            for row in reversed(rows):
-                if STOP_REQUESTED:
-                    break
-                num_cell = row.find("td", class_="gall_num")
-                if not num_cell:
-                    continue
-                num_text = num_cell.get_text(strip=True)
-                if not num_text.isdecimal():
-                    continue
-                post_id = int(num_text)
-                highest_seen = max(highest_seen, post_id)
-                if post_id <= recent:
-                    continue
-
-                title_cell = row.find("td", class_="gall_tit")
-                writer_cell = row.find("td", class_="gall_writer")
-                title = title_cell.get_text(" ", strip=True) if title_cell else "Unknown"
-                author = writer_cell.get_text(" ", strip=True) if writer_cell else "Unknown"
-
-                subject_cell = row.find("td", class_="gall_subject")
-                if subject_cell:
-                    inner = subject_cell.find("p", class_="subject_inner")
-                    subject = (inner or subject_cell).get_text(" ", strip=True)
-                    if subject:
-                        title = f"[{subject}] {title}"
-
-                logger.info("새 글 감지")
-                if not post_matches(title, author):
-                    logger.info("키워드 조건 불일치 - 다운로드 생략")
-                    continue
-
-                post_url = (
-                    f"https://gall.dcinside.com{gallery_type}board/view"
-                    f"?id={gallery_id}&no={post_id}"
-                )
-                download_post_media(post_url, gallery_id, post_id, author, image_hashes)
-
-            recent = highest_seen
-
-            elapsed = time.monotonic() - loop_started
-            sleep_for = max(0.0, POLL_SECONDS - elapsed)
-            stop_at = time.monotonic() + sleep_for
+            server_error_count += 1
+            wait_seconds = 10 if server_error_count >= 3 else POLL_SECONDS
+            if server_error_count >= 3:
+                logger.warning("연속 요청 실패. 잠시 후 계속합니다.")
+                server_error_count = 0
+            stop_at = time.monotonic() + wait_seconds
             while not STOP_REQUESTED and time.monotonic() < stop_at:
                 time.sleep(min(0.25, stop_at - time.monotonic()))
+            continue
+        server_error_count = 0
 
-        if STOP_REQUESTED:
-            logger.info("감시를 중지합니다.")
-        else:
-            logger.info("감시 시간이 끝나 정상 종료합니다.")
-        return 0
-    finally:
-        save_image_hashes(image_hashes)
+        rows = parse_posts(html)
+        highest_seen = recent
+        for row in reversed(rows):
+            if STOP_REQUESTED:
+                break
+            num_cell = row.find("td", class_="gall_num")
+            if not num_cell:
+                continue
+            num_text = num_cell.get_text(strip=True)
+            if not num_text.isdecimal():
+                continue
+            post_id = int(num_text)
+            highest_seen = max(highest_seen, post_id)
+            if post_id <= recent:
+                continue
+
+            title_cell = row.find("td", class_="gall_tit")
+            writer_cell = row.find("td", class_="gall_writer")
+            title = title_cell.get_text(" ", strip=True) if title_cell else "Unknown"
+            author = writer_cell.get_text(" ", strip=True) if writer_cell else "Unknown"
+
+            subject_cell = row.find("td", class_="gall_subject")
+            if subject_cell:
+                inner = subject_cell.find("p", class_="subject_inner")
+                subject = (inner or subject_cell).get_text(" ", strip=True)
+                if subject:
+                    title = f"[{subject}] {title}"
+
+            logger.info("새 글 감지")
+            if not post_matches(title, author):
+                logger.info("키워드 조건 불일치 - 다운로드 생략")
+                continue
+
+            post_url = (
+                f"https://gall.dcinside.com{gallery_type}board/view"
+                f"?id={gallery_id}&no={post_id}"
+            )
+            download_post_media(post_url, gallery_id, post_id, author)
+
+        recent = highest_seen
+
+        elapsed = time.monotonic() - loop_started
+        sleep_for = max(0.0, POLL_SECONDS - elapsed)
+        stop_at = time.monotonic() + sleep_for
+        while not STOP_REQUESTED and time.monotonic() < stop_at:
+            time.sleep(min(0.25, stop_at - time.monotonic()))
+
+    if STOP_REQUESTED:
+        logger.info("감시를 중지합니다.")
+    else:
+        logger.info("감시 시간이 끝나 정상 종료합니다.")
+    return 0
 
 
 if __name__ == "__main__":
