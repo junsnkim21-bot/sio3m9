@@ -212,11 +212,14 @@ def download_image(
                 logger.info("이미지 용량 제한 초과 - 건너뜀")
                 return False
 
+            # 이미지 URL/원본 파일명에 게시글 번호가 포함되는 경우가 있어
+            # 이미지 파일명은 URL의 이름을 사용하지 않고 중립적인 이름으로 저장한다.
+            # 작성자 폴더 아래 image_001.jpg, image_002.jpg ... 형태가 된다.
             raw_name = unquote(os.path.basename(urlparse(resp.url).path))
             ext = Path(raw_name).suffix.lower()
             if ext not in IMAGE_EXTENSIONS:
                 ext = extension_from_content_type(content_type)
-                raw_name = f"image_{index:03d}{ext}"
+            raw_name = f"image_{index:03d}{ext}"
 
             path = unique_path(save_dir, raw_name)
             written = 0
