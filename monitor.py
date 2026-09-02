@@ -297,12 +297,10 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
     )
 
     safe_author = safe_filename(str(author), "Unknown")
-    # 이미지는 작성자 폴더에 바로 저장한다: downloads/<gallery_id>/<author>/<image>
-    # 영상은 기존처럼 게시글 번호 폴더에 저장한다.
-    image_save_dir = DOWNLOADS_DIR / gallery_id / safe_author
-    video_save_dir = DOWNLOADS_DIR / gallery_id / safe_author / str(post_id)
-    image_save_dir.mkdir(parents=True, exist_ok=True)
-    video_save_dir.mkdir(parents=True, exist_ok=True)
+    # 이미지와 영상을 모두 작성자 폴더에 바로 저장한다.
+    # 구조: downloads/<gallery_id>/<author>/<media files>
+    media_save_dir = DOWNLOADS_DIR / gallery_id / safe_author
+    media_save_dir.mkdir(parents=True, exist_ok=True)
 
     image_urls: list[str] = []
     video_urls: list[str] = []
@@ -342,7 +340,7 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
     image_index = 1
 
     for image_url in image_urls:
-        if download_image(image_url, post_url, image_save_dir, post_budget, image_index):
+        if download_image(image_url, post_url, media_save_dir, post_budget, image_index):
             image_saved += 1
         image_index += 1
         if post_budget[0] >= MAX_POST_BYTES:
@@ -350,7 +348,7 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
 
     if post_budget[0] < MAX_POST_BYTES:
         for video_index, video_url in enumerate(video_urls, start=1):
-            if download_video(video_url, post_url, video_save_dir, post_budget, video_index):
+            if download_video(video_url, post_url, media_save_dir, post_budget, video_index):
                 video_saved += 1
             if post_budget[0] >= MAX_POST_BYTES:
                 break
@@ -359,7 +357,7 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
     if post_budget[0] < MAX_POST_BYTES:
         for external_url in external_links[:MAX_EXTERNAL_LINKS_PER_POST]:
             for image_url in collect_external_page_images(external_url, post_url):
-                if download_image(image_url, external_url, image_save_dir, post_budget, image_index):
+                if download_image(image_url, external_url, media_save_dir, post_budget, image_index):
                     image_saved += 1
                 image_index += 1
                 if post_budget[0] >= MAX_POST_BYTES:
