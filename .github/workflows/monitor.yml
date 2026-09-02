@@ -51,7 +51,10 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -q -r requirements.txt
+        run: |
+          pip install -q -r requirements.txt
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq p7zip-full >/dev/null
 
       - name: Restore image hash database
         uses: actions/cache/restore@v4
@@ -90,10 +93,8 @@ jobs:
             echo "::error::ARCHIVE_PASSWORD Secret이 설정되지 않았습니다."
             exit 1
           fi
-          sudo apt-get update -qq >/dev/null
-          sudo apt-get install -y -qq p7zip-full >/dev/null
           mkdir -p output
-          7z a -t7z -mx=7 -mhe=on -p"$ARCHIVE_PASSWORD" output/monitor-output.7z ./downloads >/dev/null
+          7z a -t7z -mx=0 -mhe=on -p"$ARCHIVE_PASSWORD" output/monitor-output.7z ./downloads >/dev/null
           rm -rf downloads
           echo "암호화 압축 완료"
 
