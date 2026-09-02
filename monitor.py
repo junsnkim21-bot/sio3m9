@@ -15,6 +15,7 @@ import ipaddress
 import logging
 import os
 import re
+import signal
 import socket
 import sys
 import time
@@ -455,96 +456,115 @@ def newest_post_id(rows) -> int:
     return newest
 
 
+STOP_REQUESTED = False
+
+
+def _request_stop(signum, frame):
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    logger.info("종료 요청을 받았습니다. 현재 상태를 저장합니다.")
+
+
 def main() -> int:
+    global STOP_REQUESTED
+    signal.signal(signal.SIGINT, _request_stop)
+    signal.signal(signal.SIGTERM, _request_stop)
+
     gallery_type, gallery_id = parse_gallery_url(GALLERY_URL)
     image_hashes = load_image_hashes()
 
-    html = get_html(GALLERY_URL)
-    if not html:
-        logger.error("초기 갤러리 페이지를 불러오지 못했습니다.")
-        return 1
-
-    rows = parse_posts(html)
-    recent = newest_post_id(rows)
-    if not recent:
-        logger.error("초기 최신 글 번호를 찾지 못했습니다.")
-        return 1
-
-    logger.info("감시 시작 (주기 %.1f초)", POLL_SECONDS)
-    logger.info("이번 실행 예정 시간: %.1f분", MONITOR_SECONDS / 60)
-
-    started = time.monotonic()
-    server_error_count = 0
-
-    while time.monotonic() - started < MONITOR_SECONDS:
-        loop_started = time.monotonic()
+    try:
         html = get_html(GALLERY_URL)
         if not html:
-            server_error_count += 1
-            if server_error_count >= 3:
-                logger.warning("연속 요청 실패. 10초 후 계속합니다.")
-                time.sleep(10)
-                server_error_count = 0
-            else:
-                time.sleep(POLL_SECONDS)
-            continue
-        server_error_count = 0
+            logger.error("초기 갤러리 페이지를 불러오지 못했습니다.")
+            return 1
 
         rows = parse_posts(html)
-        highest_seen = recent
-        for row in reversed(rows):
-            num_cell = row.find("td", class_="gall_num")
-            if not num_cell:
+        recent = newest_post_id(rows)
+        if not recent:
+            logger.error("초기 최신 글 번호를 찾지 못했습니다.")
+            return 1
+
+        logger.info("감시 시작 (주기 %.1f초)", POLL_SECONDS)
+        logger.info("이번 실행 예정 시간: %.1f분", MONITOR_SECONDS / 60)
+
+        started = time.monotonic()
+        server_error_count = 0
+
+        while not STOP_REQUESTED and time.monotonic() - started < MONITOR_SECONDS:
+            loop_started = time.monotonic()
+            html = get_html(GALLERY_URL)
+            if not html:
+                server_error_count += 1
+                wait_seconds = 10 if server_error_count >= 3 else POLL_SECONDS
+                if server_error_count >= 3:
+                    logger.warning("연속 요청 실패. 잠시 후 계속합니다.")
+                    server_error_count = 0
+                stop_at = time.monotonic() + wait_seconds
+                while not STOP_REQUESTED and time.monotonic() < stop_at:
+                    time.sleep(min(0.25, stop_at - time.monotonic()))
                 continue
-            num_text = num_cell.get_text(strip=True)
-            if not num_text.isdecimal():
-                continue
-            post_id = int(num_text)
-            highest_seen = max(highest_seen, post_id)
-            if post_id <= recent:
-                continue
+            server_error_count = 0
 
-            title_cell = row.find("td", class_="gall_tit")
-            writer_cell = row.find("td", class_="gall_writer")
-            title = title_cell.get_text(" ", strip=True) if title_cell else "Unknown"
-            author = writer_cell.get_text(" ", strip=True) if writer_cell else "Unknown"
+            rows = parse_posts(html)
+            highest_seen = recent
+            for row in reversed(rows):
+                if STOP_REQUESTED:
+                    break
+                num_cell = row.find("td", class_="gall_num")
+                if not num_cell:
+                    continue
+                num_text = num_cell.get_text(strip=True)
+                if not num_text.isdecimal():
+                    continue
+                post_id = int(num_text)
+                highest_seen = max(highest_seen, post_id)
+                if post_id <= recent:
+                    continue
 
-            subject_cell = row.find("td", class_="gall_subject")
-            if subject_cell:
-                inner = subject_cell.find("p", class_="subject_inner")
-                subject = (inner or subject_cell).get_text(" ", strip=True)
-                if subject:
-                    title = f"[{subject}] {title}"
+                title_cell = row.find("td", class_="gall_tit")
+                writer_cell = row.find("td", class_="gall_writer")
+                title = title_cell.get_text(" ", strip=True) if title_cell else "Unknown"
+                author = writer_cell.get_text(" ", strip=True) if writer_cell else "Unknown"
 
-            logger.info("새 글 감지")
-            if not post_matches(title, author):
-                logger.info("키워드 조건 불일치 - 다운로드 생략")
-                continue
+                subject_cell = row.find("td", class_="gall_subject")
+                if subject_cell:
+                    inner = subject_cell.find("p", class_="subject_inner")
+                    subject = (inner or subject_cell).get_text(" ", strip=True)
+                    if subject:
+                        title = f"[{subject}] {title}"
 
-            post_url = (
-                f"https://gall.dcinside.com{gallery_type}board/view"
-                f"?id={gallery_id}&no={post_id}"
-            )
-            download_post_media(post_url, gallery_id, post_id, author, image_hashes)
+                logger.info("새 글 감지")
+                if not post_matches(title, author):
+                    logger.info("키워드 조건 불일치 - 다운로드 생략")
+                    continue
 
-        recent = highest_seen
+                post_url = (
+                    f"https://gall.dcinside.com{gallery_type}board/view"
+                    f"?id={gallery_id}&no={post_id}"
+                )
+                download_post_media(post_url, gallery_id, post_id, author, image_hashes)
 
-        elapsed = time.monotonic() - loop_started
-        sleep_for = max(0.0, POLL_SECONDS - elapsed)
-        if sleep_for:
-            time.sleep(sleep_for)
+            recent = highest_seen
 
-    save_image_hashes(image_hashes)
-    logger.info("감시 시간이 끝나 정상 종료합니다.")
-    return 0
+            elapsed = time.monotonic() - loop_started
+            sleep_for = max(0.0, POLL_SECONDS - elapsed)
+            stop_at = time.monotonic() + sleep_for
+            while not STOP_REQUESTED and time.monotonic() < stop_at:
+                time.sleep(min(0.25, stop_at - time.monotonic()))
+
+        if STOP_REQUESTED:
+            logger.info("감시를 중지합니다.")
+        else:
+            logger.info("감시 시간이 끝나 정상 종료합니다.")
+        return 0
+    finally:
+        save_image_hashes(image_hashes)
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except KeyboardInterrupt:
-        logger.info("사용자 요청으로 종료합니다.")
-        raise SystemExit(0)
     except Exception:
         logger.exception("예상하지 못한 오류로 종료합니다.")
         raise SystemExit(1)
