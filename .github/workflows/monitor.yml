@@ -1,0 +1,108 @@
+name: DC Monitor
+
+on:
+  workflow_dispatch:
+    inputs:
+      gallery_url:
+        description: '감시할 디시인사이드 갤러리 URL'
+        required: true
+        default: 'https://gall.dcinside.com/mgallery/board/lists?id=aoegame'
+        type: string
+      keywords:
+        description: '키워드(쉼표로 구분, 비우면 모든 새 글)'
+        required: false
+        default: ''
+        type: string
+      filter_field:
+        description: '키워드 검색 범위'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - title
+          - author
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: '1'
+  POLL_SECONDS: '3'
+  MONITOR_SECONDS: '20700'
+  MAX_EXTERNAL_LINKS_PER_POST: '5'
+  MAX_EXTERNAL_IMAGES_PER_PAGE: '30'
+  MAX_IMAGE_BYTES: '20971520'
+  MAX_POST_BYTES: '209715200'
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -q -r requirements.txt
+
+      - name: Restore image hash database
+        uses: actions/cache/restore@v4
+        with:
+          path: data/image_hashes.txt
+          key: dc-image-hashes-${{ github.run_id }}
+          restore-keys: |
+            dc-image-hashes-
+
+      - name: Run monitor
+        env:
+          GALLERY_URL: ${{ inputs.gallery_url }}
+          KEYWORDS: ${{ inputs.keywords }}
+          FILTER_FIELD: ${{ inputs.filter_field }}
+        run: python monitor.py
+
+      - name: Save image hash database
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/image_hashes.txt
+          key: dc-image-hashes-${{ github.run_id }}
+
+      - name: Create encrypted archive
+        if: always()
+        env:
+          ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d downloads ] || [ -z "$(find downloads -type f -print -quit 2>/dev/null)" ]; then
+            echo "저장된 미디어 없음"
+            exit 0
+          fi
+          if [ -z "${ARCHIVE_PASSWORD:-}" ]; then
+            echo "::error::ARCHIVE_PASSWORD Secret이 설정되지 않았습니다."
+            exit 1
+          fi
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq p7zip-full >/dev/null
+          mkdir -p output
+          7z a -t7z -mx=7 -mhe=on -p"$ARCHIVE_PASSWORD" output/monitor-output.7z ./downloads >/dev/null
+          rm -rf downloads
+          echo "암호화 압축 완료"
+
+      - name: Upload encrypted output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-output-${{ github.run_number }}
+          path: output/*.7z
+          if-no-files-found: ignore
+          retention-days: 1
+          compression-level: 0
