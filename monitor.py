@@ -26,6 +26,7 @@ from bs4 import BeautifulSoup
 
 
 POLL_SECONDS = max(1.0, float(os.getenv("POLL_SECONDS", "3")))
+STATUS_LOG_SECONDS = max(10.0, float(os.getenv("STATUS_LOG_SECONDS", "60")))
 MONITOR_SECONDS = max(30, int(os.getenv("MONITOR_SECONDS", str(5 * 60 * 60 + 45 * 60))))
 GALLERY_URL = os.getenv(
     "GALLERY_URL",
@@ -683,17 +684,33 @@ def main() -> int:
         return 1
 
     rows = parse_posts(html)
-    recent = newest_post_id(rows)
-    if not recent:
-        logger.error("초기 최신 글 번호를 찾지 못했습니다.")
+
+    # 프로그램 시작 시 목록에 이미 존재하던 일반글은 "기존 글"로 등록한다.
+    # 이후 목록에 처음 나타난 글번호만 새 글로 처리한다.
+    seen_post_ids: set[int] = set()
+    for row in rows:
+        num_cell = row.find("td", class_="gall_num")
+        if not num_cell:
+            continue
+        num_text = num_cell.get_text(strip=True)
+        if num_text.isdecimal():
+            seen_post_ids.add(int(num_text))
+
+    if not seen_post_ids:
+        logger.error("초기 일반글 번호를 찾지 못했습니다.")
         return 1
 
-    logger.info("감시 시작 - gallery=%s, 시작 최신 글=%s, 주기=%.1f초", gallery_id, recent, POLL_SECONDS)
+    startup_latest = max(seen_post_ids)
+    logger.info(
+        "감시 시작 - gallery=%s, 시작 최신 글=%s, 기존 글 %d개 등록, 주기=%.1f초",
+        gallery_id, startup_latest, len(seen_post_ids), POLL_SECONDS,
+    )
     logger.info("이번 실행 예정 시간: %.1f분", MONITOR_SECONDS / 60)
 
     started = time.monotonic()
     tracked_comment_posts: dict[int, dict] = {}
     server_error_count = 0
+    last_status_log = started
     logger.info("댓글 링크 감시: 실행 후 새 글만 %.0f분 동안 %.1f초 간격", COMMENT_TRACK_SECONDS / 60, COMMENT_POLL_SECONDS)
 
     while time.monotonic() - started < MONITOR_SECONDS:
@@ -716,7 +733,16 @@ def main() -> int:
             tracked_comment_posts, gallery_type, gallery_id, image_hashes, seen_comment_links
         )
 
-        highest_seen = recent
+        now = time.monotonic()
+        if now - last_status_log >= STATUS_LOG_SECONDS:
+            logger.info(
+                "감시 정상 작동 중 - 새 글 확인 중 / 추적 댓글 글 %d개",
+                len(tracked_comment_posts),
+            )
+            last_status_log = now
+
+        # 목록 순서와 글번호 증가 여부에 의존하지 않고, 이번 실행에서 처음 본
+        # 글번호를 새 글로 판단한다. reversed(rows)로 오래된 새 글부터 처리한다.
         for row in reversed(rows):
             num_cell = row.find("td", class_="gall_num")
             if not num_cell:
@@ -725,9 +751,11 @@ def main() -> int:
             if not num_text.isdecimal():
                 continue
             post_id = int(num_text)
-            highest_seen = max(highest_seen, post_id)
-            if post_id <= recent:
+            if post_id in seen_post_ids:
                 continue
+
+            # 같은 루프나 다음 루프에서 중복 처리되지 않도록 가장 먼저 기록한다.
+            seen_post_ids.add(post_id)
 
             title_cell = row.find("td", class_="gall_tit")
             writer_cell = row.find("td", class_="gall_writer")
@@ -742,16 +770,9 @@ def main() -> int:
                     title = f"[{subject}] {title}"
 
             logger.info("새 글 감지: %s | %s | %s", post_id, author, title)
-            if not post_matches(title, author):
-                logger.info("키워드 조건 불일치 - 다운로드 생략: %s", post_id)
-                continue
 
-            post_url = (
-                f"https://gall.dcinside.com{gallery_type}board/view"
-                f"?id={gallery_id}&no={post_id}"
-            )
-            download_post_media(post_url, gallery_id, post_id, author, image_hashes)
-
+            # 댓글 추적은 본문 키워드 필터와 독립적으로 새 글 기준으로 등록한다.
+            # 단, 지정한 제외 작성자는 등록하지 않는다.
             if should_track_comments(author):
                 registered = time.monotonic()
                 tracked_comment_posts[post_id] = {
@@ -766,7 +787,16 @@ def main() -> int:
             else:
                 logger.info("댓글 추적 제외 작성자: post=%s author=%s", post_id, author)
 
-        recent = highest_seen
+            # 본문 이미지/영상 다운로드는 기존 키워드 조건을 그대로 따른다.
+            if not post_matches(title, author):
+                logger.info("키워드 조건 불일치 - 본문 다운로드 생략: %s", post_id)
+                continue
+
+            post_url = (
+                f"https://gall.dcinside.com{gallery_type}board/view"
+                f"?id={gallery_id}&no={post_id}"
+            )
+            download_post_media(post_url, gallery_id, post_id, author, image_hashes)
 
         elapsed = time.monotonic() - loop_started
         sleep_for = max(0.0, POLL_SECONDS - elapsed)
