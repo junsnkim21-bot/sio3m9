@@ -317,6 +317,14 @@ def download_video(video_url: str, referer: str, save_dir: Path, post_budget: li
 
 
 def collect_external_page_images(page_url: str, post_url: str) -> list[str]:
+    """외부 페이지에서 '콘텐츠로 볼 근거가 강한' 이미지만 수집한다.
+
+    사이트 로고/버튼/닉네임 아이콘 같은 모든 <img>를 훑지 않는다.
+    - og:image / twitter:image
+    - rel=image_src
+    - 이미지 파일로 직접 연결되는 <a href>
+    만 대상으로 한다.
+    """
     if not is_public_http_url(page_url):
         return []
 
@@ -340,44 +348,60 @@ def collect_external_page_images(page_url: str, post_url: str) -> list[str]:
 
     soup = BeautifulSoup(resp.text, "html.parser")
     found: list[str] = []
-    for tag in soup.find_all("img"):
-        src = tag.get("data-original") or tag.get("data-src") or tag.get("data-lazy-src") or tag.get("src")
-        if not src:
-            continue
-        full = urljoin(resp.url, src)
-        if not is_public_http_url(full):
-            continue
-        found.append(full)
-        if len(found) >= MAX_EXTERNAL_IMAGES_PER_PAGE:
-            break
-    return found
+    seen: set[str] = set()
 
+    def add_candidate(value: str | None) -> None:
+        if not value:
+            return
+        full = urljoin(resp.url, value.strip())
+        if full in seen or not is_public_http_url(full):
+            return
+        seen.add(full)
+        found.append(full)
+
+    # 페이지 대표/콘텐츠 이미지 메타데이터만 허용한다.
+    for tag in soup.find_all("meta"):
+        key = (tag.get("property") or tag.get("name") or "").strip().lower()
+        if key in {"og:image", "og:image:url", "og:image:secure_url", "twitter:image", "twitter:image:src"}:
+            add_candidate(tag.get("content"))
+            if len(found) >= MAX_EXTERNAL_IMAGES_PER_PAGE:
+                return found
+
+    # 명시적인 대표 이미지 링크.
+    for tag in soup.find_all("link", href=True):
+        rel = {str(x).lower() for x in (tag.get("rel") or [])}
+        if "image_src" in rel:
+            add_candidate(tag.get("href"))
+            if len(found) >= MAX_EXTERNAL_IMAGES_PER_PAGE:
+                return found
+
+    # 페이지 내부에서 '이미지 파일 자체'로 직접 연결된 링크만 허용한다.
+    for tag in soup.find_all("a", href=True):
+        full = urljoin(resp.url, tag["href"])
+        if Path(urlparse(full).path).suffix.lower() in IMAGE_EXTENSIONS:
+            add_candidate(full)
+            if len(found) >= MAX_EXTERNAL_IMAGES_PER_PAGE:
+                break
+
+    return found
 
 
 COMMENT_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
 def extract_urls_from_comment_html(html: str, base_url: str) -> list[tuple[str, str]]:
-    """댓글 응답에서 (댓글번호, URL) 목록을 추출한다."""
+    """댓글에 실제로 적힌 URL만 (댓글번호, URL) 형태로 추출한다.
+
+    댓글 HTML 안의 아이콘/닉네임 이미지와 UI 링크는 수집하지 않는다.
+    """
     soup = BeautifulSoup(html, "html.parser")
     found: list[tuple[str, str]] = []
 
     for li in soup.find_all("li"):
         comment_id = str(li.get("no") or li.get("data-no") or "unknown")
-        urls: list[str] = []
+        text_value = li.get_text(" ", strip=True)
 
-        for tag in li.find_all("a", href=True):
-            urls.append(urljoin(base_url, tag["href"]))
-
-        for tag in li.find_all("img"):
-            src = tag.get("data-original") or tag.get("data-src") or tag.get("src")
-            if src:
-                urls.append(urljoin(base_url, src))
-
-        text = li.get_text(" ", strip=True)
-        urls.extend(COMMENT_URL_RE.findall(text))
-
-        for url in urls:
+        for url in COMMENT_URL_RE.findall(text_value):
             url = url.rstrip(".,;:!?)]}\"'")
             parsed = urlparse(url)
             if parsed.scheme in ("http", "https") and parsed.netloc:
@@ -519,8 +543,10 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
         soup.find("div", class_="writing_view_box")
         or soup.find("div", class_="write_div")
         or soup.find("div", class_="view_content_wrap")
-        or soup
     )
+    if content is None:
+        logger.warning("게시글 본문 영역을 찾지 못해 페이지 UI 이미지 수집을 방지하고 건너뜀: %s", post_url)
+        return
 
     safe_author = safe_filename(str(author), "Unknown")
     # 게시글 번호 폴더를 넣어 서로 다른 글의 파일명이 섞이지 않게 한다.
