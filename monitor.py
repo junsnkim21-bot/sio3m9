@@ -5,26 +5,23 @@
 - 기본 3초 간격 새 글 감시
 - 게시글 본문 이미지/직접 첨부 영상 다운로드
 - 외부 링크는 1단계까지만 열어 이미지 수집
-- Google Drive 공개 이미지/영상 파일 링크 자동 다운로드
-- 이미지 중복 제거 없음
-- 영상 중복 제거 없음
+- 이미지는 SHA-256 기준으로 실행 간 중복 제거
+- 영상은 중복 검사하지 않음
+- GitHub Actions Cache의 data/image_hashes.txt 로 이미지 해시를 이어서 사용
 """
 
+import hashlib
 import ipaddress
 import logging
 import os
 import re
-import signal
 import socket
 import sys
 import time
-import tempfile
-import shutil
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
-import gdown
 from bs4 import BeautifulSoup
 
 
@@ -44,9 +41,17 @@ MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(20 * 1024 * 1024)))
 MAX_POST_BYTES = int(os.getenv("MAX_POST_BYTES", str(200 * 1024 * 1024)))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "10"))
 
+# 최근 글 댓글 링크 재검사 설정
+COMMENT_RECENT_POSTS = max(1, int(os.getenv("COMMENT_RECENT_POSTS", "20")))
+COMMENT_POLL_SECONDS = min(30.0, max(10.0, float(os.getenv("COMMENT_POLL_SECONDS", "20"))))
+COMMENT_MAX_PAGES = max(1, int(os.getenv("COMMENT_MAX_PAGES", "20")))
+
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".avi", ".mkv", ".m4v")
+DATA_DIR = Path("data")
 DOWNLOADS_DIR = Path("downloads")
+HASH_FILE = DATA_DIR / "image_hashes.txt"
+COMMENT_LINK_FILE = DATA_DIR / "comment_links.txt"
 
 
 logging.basicConfig(
@@ -75,7 +80,7 @@ def get_html(url: str, referer: str | None = None):
         resp.raise_for_status()
         return resp.text
     except requests.RequestException as exc:
-        logger.warning("페이지 요청 실패")
+        logger.warning("페이지 요청 실패: %s (%s)", url, exc)
         return None
 
 
@@ -90,6 +95,61 @@ def parse_gallery_url(url: str):
     return match.group("gallery_type"), match.group("gallery_id")
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_image_hashes() -> set[str]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    hashes: set[str] = set()
+
+    if HASH_FILE.exists():
+        for line in HASH_FILE.read_text(encoding="utf-8").splitlines():
+            value = line.strip().lower()
+            if re.fullmatch(r"[0-9a-f]{64}", value):
+                hashes.add(value)
+
+    # 현재 downloads 폴더에 실제로 존재하는 이미지도 함께 검사한다.
+    if DOWNLOADS_DIR.is_dir():
+        for path in DOWNLOADS_DIR.rglob("*"):
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                try:
+                    hashes.add(sha256_file(path))
+                except OSError:
+                    logger.warning("기존 이미지 해시 계산 실패: %s", path)
+
+    logger.info("기존 이미지 해시 %d개 로드", len(hashes))
+    return hashes
+
+
+def save_image_hashes(hashes: set[str]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = HASH_FILE.with_suffix(".tmp")
+    tmp.write_text("\n".join(sorted(hashes)) + ("\n" if hashes else ""), encoding="utf-8")
+    tmp.replace(HASH_FILE)
+
+
+
+def load_seen_comment_links() -> set[str]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not COMMENT_LINK_FILE.exists():
+        return set()
+    return {
+        line.strip()
+        for line in COMMENT_LINK_FILE.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
+
+def save_seen_comment_links(seen: set[str]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = COMMENT_LINK_FILE.with_suffix(".tmp")
+    tmp.write_text("\n".join(sorted(seen)) + ("\n" if seen else ""), encoding="utf-8")
+    tmp.replace(COMMENT_LINK_FILE)
 
 def is_public_http_url(url: str) -> bool:
     """외부 페이지 추적 시 localhost/사설망/메타데이터 주소 접근 방지."""
@@ -152,11 +212,11 @@ def download_image(
     image_url: str,
     referer: str,
     save_dir: Path,
+    image_hashes: set[str],
     post_budget: list[int],
     index: int,
 ) -> bool:
-    """이미지를 임시 파일에 받은 뒤 성공한 경우에만 작성자 폴더를 만든다."""
-    temp_path = None
+    """이미지 저장. 동일 SHA-256이면 새 파일을 삭제한다."""
     try:
         with session.get(
             image_url,
@@ -172,24 +232,18 @@ def download_image(
 
             content_length = resp.headers.get("Content-Length")
             if content_length and int(content_length) > MAX_IMAGE_BYTES:
-                logger.info("이미지 용량 제한 초과 - 건너뜀")
+                logger.info("이미지 용량 제한 초과, 건너뜀: %s", image_url)
                 return False
 
             raw_name = unquote(os.path.basename(urlparse(resp.url).path))
             ext = Path(raw_name).suffix.lower()
             if ext not in IMAGE_EXTENSIONS:
                 ext = extension_from_content_type(content_type)
-            raw_name = f"image_{index:03d}{ext}"
+                raw_name = f"image_{index:03d}{ext}"
 
-            # 작성자 폴더 밖의 임시 위치에 먼저 저장한다.
-            tmp_dir = DOWNLOADS_DIR / ".tmp"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(prefix="img_", suffix=".part", dir=tmp_dir)
-            os.close(fd)
-            temp_path = Path(tmp_name)
-
+            path = unique_path(save_dir, raw_name)
             written = 0
-            with temp_path.open("wb") as f:
+            with path.open("wb") as f:
                 for chunk in resp.iter_content(chunk_size=1024 * 1024):
                     if not chunk:
                         continue
@@ -198,31 +252,29 @@ def download_image(
                         raise ValueError("이미지 또는 게시글 다운로드 용량 제한 초과")
                     f.write(chunk)
 
-        if written <= 0:
+        image_hash = sha256_file(path)
+        if image_hash in image_hashes:
+            path.unlink(missing_ok=True)
+            logger.info("중복 이미지 제외(SHA-256): %s", image_url)
             return False
 
-        # 다운로드 성공 후에만 작성자 폴더 생성 및 최종 이동.
-        save_dir.mkdir(parents=True, exist_ok=True)
-        final_path = unique_path(save_dir, raw_name)
-        shutil.move(str(temp_path), str(final_path))
-        temp_path = None
+        image_hashes.add(image_hash)
+        save_image_hashes(image_hashes)
         post_budget[0] += written
-        logger.info("새 이미지 저장")
+        logger.info("이미지 저장: %s", path)
         return True
-    except (requests.RequestException, OSError, ValueError):
-        logger.warning("이미지 다운로드 실패")
+    except (requests.RequestException, OSError, ValueError) as exc:
+        try:
+            if "path" in locals() and path.exists():
+                path.unlink()
+        except OSError:
+            pass
+        logger.warning("이미지 다운로드 실패: %s (%s)", image_url, exc)
         return False
-    finally:
-        if temp_path is not None:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
 def download_video(video_url: str, referer: str, save_dir: Path, post_budget: list[int], index: int) -> bool:
-    """영상을 임시 파일에 받은 뒤 성공한 경우에만 작성자 폴더를 만든다."""
-    temp_path = None
+    """영상은 요청대로 SHA/URL 중복 검사를 하지 않는다."""
     try:
         with session.get(
             video_url,
@@ -240,14 +292,9 @@ def download_video(video_url: str, referer: str, save_dir: Path, post_budget: li
             if Path(raw_name).suffix.lower() not in VIDEO_EXTENSIONS:
                 raw_name = f"video_{index:03d}.mp4"
 
-            tmp_dir = DOWNLOADS_DIR / ".tmp"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(prefix="vid_", suffix=".part", dir=tmp_dir)
-            os.close(fd)
-            temp_path = Path(tmp_name)
-
+            path = unique_path(save_dir, raw_name)
             written = 0
-            with temp_path.open("wb") as f:
+            with path.open("wb") as f:
                 for chunk in resp.iter_content(chunk_size=1024 * 1024):
                     if not chunk:
                         continue
@@ -256,159 +303,17 @@ def download_video(video_url: str, referer: str, save_dir: Path, post_budget: li
                         raise ValueError("게시글 다운로드 용량 제한 초과")
                     f.write(chunk)
 
-        if written <= 0:
-            return False
-
-        save_dir.mkdir(parents=True, exist_ok=True)
-        final_path = unique_path(save_dir, raw_name)
-        shutil.move(str(temp_path), str(final_path))
-        temp_path = None
         post_budget[0] += written
-        logger.info("새 영상 저장")
+        logger.info("영상 저장: %s", path)
         return True
-    except (requests.RequestException, OSError, ValueError):
-        logger.warning("영상 다운로드 실패")
-        return False
-    finally:
-        if temp_path is not None:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-
-
-
-def extract_google_drive_file_id(url: str) -> str | None:
-    """공개 Google Drive 단일 파일 링크에서 파일 ID를 추출한다.
-
-    지원 예:
-    - https://drive.google.com/file/d/<ID>/view
-    - https://drive.google.com/open?id=<ID>
-    - https://drive.google.com/uc?id=<ID>&export=download
-    - https://drive.usercontent.google.com/download?id=<ID>
-
-    폴더 링크는 의도적으로 지원하지 않는다.
-    """
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if host not in {"drive.google.com", "drive.usercontent.google.com"}:
-        return None
-
-    if "/drive/folders/" in parsed.path or "/folders/" in parsed.path:
-        return None
-
-    match = re.search(r"/file/d/([A-Za-z0-9_-]+)", parsed.path)
-    if match:
-        return match.group(1)
-
-    from urllib.parse import parse_qs
-    file_id = parse_qs(parsed.query).get("id", [None])[0]
-    if file_id and re.fullmatch(r"[A-Za-z0-9_-]+", file_id):
-        return file_id
-    return None
-
-
-def sniff_media_extension(path: Path) -> tuple[str | None, str | None]:
-    """파일 시그니처로 이미지/영상 종류를 판별한다.
-
-    반환값: ("image" | "video" | None, 확장자 | None)
-    """
-    try:
-        with path.open("rb") as f:
-            head = f.read(64)
-    except OSError:
-        return None, None
-
-    if head.startswith(b"\xff\xd8\xff"):
-        return "image", ".jpg"
-    if head.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image", ".png"
-    if head.startswith((b"GIF87a", b"GIF89a")):
-        return "image", ".gif"
-    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-        return "image", ".webp"
-    if head.startswith(b"BM"):
-        return "image", ".bmp"
-
-    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"AVI ":
-        return "video", ".avi"
-    if head.startswith(b"\x1aE\xdf\xa3"):
-        # WebM과 Matroska는 같은 EBML 헤더를 사용하므로 일반적인 웹 업로드 기준 .webm 사용.
-        return "video", ".webm"
-    if len(head) >= 12 and head[4:8] == b"ftyp":
-        major_brand = head[8:12]
-        if major_brand in {b"qt  ", b"M4V ", b"M4VH", b"M4VP"}:
-            return "video", ".mov" if major_brand == b"qt  " else ".m4v"
-        return "video", ".mp4"
-
-    return None, None
-
-
-def download_google_drive_media(
-    drive_url: str,
-    save_dir: Path,
-    post_budget: list[int],
-    image_index: int,
-    video_index: int,
-) -> tuple[bool, str | None]:
-    """공개 Google Drive 단일 파일을 받아 이미지/영상일 때만 저장한다.
-
-    로그인이나 별도 권한이 필요한 파일은 실패 처리한다.
-    작성자 폴더는 실제 저장 성공 시에만 생성된다.
-    """
-    file_id = extract_google_drive_file_id(drive_url)
-    if not file_id:
-        return False, None
-
-    tmp_dir = DOWNLOADS_DIR / ".tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix="gdrive_", suffix=".part", dir=tmp_dir)
-    os.close(fd)
-    temp_path = Path(tmp_name)
-
-    try:
-        # gdown은 공개 파일의 Google Drive 확인/리디렉션 페이지를 처리한다.
-        result = gdown.download(
-            id=file_id,
-            output=str(temp_path),
-            quiet=True,
-        )
-        if not result or not temp_path.exists():
-            logger.warning("Google Drive 공개 파일 다운로드 실패")
-            return False, None
-
-        size = temp_path.stat().st_size
-        if size <= 0 or post_budget[0] + size > MAX_POST_BYTES:
-            logger.info("Google Drive 파일 용량 제한 초과 - 건너뜀")
-            return False, None
-
-        media_type, ext = sniff_media_extension(temp_path)
-        if media_type == "image":
-            if size > MAX_IMAGE_BYTES:
-                logger.info("Google Drive 이미지 용량 제한 초과 - 건너뜀")
-                return False, None
-            filename = f"image_{image_index:03d}{ext}"
-        elif media_type == "video":
-            filename = f"video_{video_index:03d}{ext}"
-        else:
-            logger.info("Google Drive 링크가 지원 이미지/영상 파일이 아님 - 건너뜀")
-            return False, None
-
-        save_dir.mkdir(parents=True, exist_ok=True)
-        final_path = unique_path(save_dir, filename)
-        shutil.move(str(temp_path), str(final_path))
-        post_budget[0] += size
-        logger.info("Google Drive 공개 미디어 저장")
-        return True, media_type
-    except Exception:
-        logger.warning("Google Drive 공개 파일 처리 실패")
-        return False, None
-    finally:
+    except (requests.RequestException, OSError, ValueError) as exc:
         try:
-            temp_path.unlink(missing_ok=True)
+            if "path" in locals() and path.exists():
+                path.unlink()
         except OSError:
             pass
+        logger.warning("영상 다운로드 실패: %s (%s)", video_url, exc)
+        return False
 
 
 def collect_external_page_images(page_url: str, post_url: str) -> list[str]:
@@ -448,7 +353,163 @@ def collect_external_page_images(page_url: str, post_url: str) -> list[str]:
     return found
 
 
-def download_post_media(post_url: str, gallery_id: str, post_id: int, author: str):
+
+COMMENT_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+
+def extract_urls_from_comment_html(html: str, base_url: str) -> list[tuple[str, str]]:
+    """댓글 응답에서 (댓글번호, URL) 목록을 추출한다."""
+    soup = BeautifulSoup(html, "html.parser")
+    found: list[tuple[str, str]] = []
+
+    for li in soup.find_all("li"):
+        comment_id = str(li.get("no") or li.get("data-no") or "unknown")
+        urls: list[str] = []
+
+        for tag in li.find_all("a", href=True):
+            urls.append(urljoin(base_url, tag["href"]))
+
+        for tag in li.find_all("img"):
+            src = tag.get("data-original") or tag.get("data-src") or tag.get("src")
+            if src:
+                urls.append(urljoin(base_url, src))
+
+        text = li.get_text(" ", strip=True)
+        urls.extend(COMMENT_URL_RE.findall(text))
+
+        for url in urls:
+            url = url.rstrip(".,;:!?)]}\"'")
+            parsed = urlparse(url)
+            if parsed.scheme in ("http", "https") and parsed.netloc:
+                found.append((comment_id, url))
+
+    return found
+
+
+def fetch_comment_links(gallery_id: str, post_id: int) -> list[tuple[str, str]]:
+    """모바일 댓글 AJAX를 페이지별로 조회해 댓글 URL을 수집한다."""
+    endpoint = "https://m.dcinside.com/ajax/response-comment"
+    referer = f"https://m.dcinside.com/board/{gallery_id}/{post_id}"
+    all_links: list[tuple[str, str]] = []
+
+    for page in range(1, COMMENT_MAX_PAGES + 1):
+        payload = {
+            "id": gallery_id,
+            "no": str(post_id),
+            "cpage": str(page),
+            "managerskill": "",
+            "del_scope": "1",
+            "csort": "",
+        }
+        headers = {"Referer": referer, "X-Requested-With": "XMLHttpRequest"}
+        try:
+            resp = session.post(endpoint, data=payload, headers=headers, timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            logger.warning("댓글 요청 실패: post=%s page=%s (%s)", post_id, page, exc)
+            break
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        if not soup.find_all("li"):
+            break
+
+        all_links.extend(extract_urls_from_comment_html(resp.text, referer))
+
+        pgnum = soup.find("span", class_="pgnum")
+        if not pgnum:
+            break
+        nums = [int(x) for x in re.findall(r"\d+", pgnum.get_text(" ", strip=True))]
+        if nums and page >= max(nums):
+            break
+
+    return all_links
+
+
+def process_comment_url(
+    url: str,
+    post_url: str,
+    save_dir: Path,
+    image_hashes: set[str],
+    post_budget: list[int],
+    image_index: list[int],
+) -> None:
+    """댓글 URL을 이미지/영상 직링크 또는 외부 페이지로 처리한다."""
+    if not is_public_http_url(url):
+        logger.info("댓글 링크 제외(공개 HTTP 아님): %s", url)
+        return
+
+    ext = Path(urlparse(url).path).suffix.lower()
+    if ext in IMAGE_EXTENSIONS:
+        download_image(url, post_url, save_dir, image_hashes, post_budget, image_index[0])
+        image_index[0] += 1
+        return
+    if ext in VIDEO_EXTENSIONS:
+        download_video(url, post_url, save_dir, post_budget, image_index[0])
+        image_index[0] += 1
+        return
+
+    for image_url in collect_external_page_images(url, post_url):
+        if post_budget[0] >= MAX_POST_BYTES:
+            break
+        download_image(image_url, url, save_dir, image_hashes, post_budget, image_index[0])
+        image_index[0] += 1
+
+
+def check_recent_post_comments(
+    rows,
+    gallery_type: str,
+    gallery_id: str,
+    image_hashes: set[str],
+    seen_comment_links: set[str],
+) -> None:
+    """목록의 최신 일반글 N개 댓글에서 새 URL만 추적한다."""
+    recent_posts: list[tuple[int, str]] = []
+    for row in rows:
+        num_cell = row.find("td", class_="gall_num")
+        if not num_cell:
+            continue
+        num_text = num_cell.get_text(strip=True)
+        if not num_text.isdecimal():
+            continue
+        post_id = int(num_text)
+        writer_cell = row.find("td", class_="gall_writer")
+        author = writer_cell.get_text(" ", strip=True) if writer_cell else "Unknown"
+        recent_posts.append((post_id, author))
+        if len(recent_posts) >= COMMENT_RECENT_POSTS:
+            break
+
+    newly_seen = 0
+    for post_id, author in recent_posts:
+        post_url = (
+            f"https://gall.dcinside.com{gallery_type}board/view"
+            f"?id={gallery_id}&no={post_id}"
+        )
+        save_dir = DOWNLOADS_DIR / gallery_id / safe_filename(str(author), "Unknown") / str(post_id)
+        links = fetch_comment_links(gallery_id, post_id)
+        if not links:
+            continue
+
+        post_budget = [0]
+        image_index = [10001]
+        for comment_id, url in links:
+            key = f"{gallery_id}|{post_id}|{comment_id}|{url}"
+            if key in seen_comment_links:
+                continue
+
+            save_dir.mkdir(parents=True, exist_ok=True)
+            logger.info("새 댓글 링크 감지: post=%s comment=%s | %s", post_id, comment_id, url)
+            process_comment_url(url, post_url, save_dir, image_hashes, post_budget, image_index)
+            seen_comment_links.add(key)
+            newly_seen += 1
+
+            if post_budget[0] >= MAX_POST_BYTES:
+                break
+
+    if newly_seen:
+        save_seen_comment_links(seen_comment_links)
+        logger.info("댓글 링크 %d개 새로 처리", newly_seen)
+
+def download_post_media(post_url: str, gallery_id: str, post_id: int, author: str, image_hashes: set[str]):
     html = get_html(post_url)
     if not html:
         return
@@ -462,14 +523,13 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
     )
 
     safe_author = safe_filename(str(author), "Unknown")
-    # 이미지/영상이 실제로 저장될 때만 작성자 폴더를 만든다.
-    # 구조: downloads/<gallery_id>/<author>/<media files>
-    media_save_dir = DOWNLOADS_DIR / gallery_id / safe_author
+    # 게시글 번호 폴더를 넣어 서로 다른 글의 파일명이 섞이지 않게 한다.
+    save_dir = DOWNLOADS_DIR / gallery_id / safe_author / str(post_id)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     image_urls: list[str] = []
     video_urls: list[str] = []
     external_links: list[str] = []
-    google_drive_links: list[str] = []
 
     for tag in content.find_all("img"):
         src = tag.get("data-original") or tag.get("data-src") or tag.get("data-lazy-src") or tag.get("src")
@@ -491,55 +551,32 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
         if parsed.scheme not in ("http", "https"):
             continue
         ext = Path(parsed.path).suffix.lower()
-        drive_file_id = extract_google_drive_file_id(full)
-        if drive_file_id:
-            google_drive_links.append(full)
-        elif ext in IMAGE_EXTENSIONS:
+        if ext in IMAGE_EXTENSIONS:
             image_urls.append(full)
         elif ext in VIDEO_EXTENSIONS:
             video_urls.append(full)
         elif parsed.netloc and "dcinside.com" not in parsed.netloc.lower():
             external_links.append(full)
 
-    # 이미지 중복 제거는 하지 않는다. 같은 이미지가 다시 나타나도 그대로 저장한다.
+    # URL 자체는 중복 판정 기준으로 쓰지 않는다.
+    # 같은 URL이 HTML에 여러 번 나타나도 그대로 시도할 수 있으며,
+    # 이미지 중복 여부는 오직 다운로드 후 SHA-256으로 결정한다.
     post_budget = [0]
     image_saved = 0
     video_saved = 0
     image_index = 1
 
     for image_url in image_urls:
-        if download_image(image_url, post_url, media_save_dir, post_budget, image_index):
+        if download_image(image_url, post_url, save_dir, image_hashes, post_budget, image_index):
             image_saved += 1
         image_index += 1
         if post_budget[0] >= MAX_POST_BYTES:
             break
 
-    next_video_index = 1
     if post_budget[0] < MAX_POST_BYTES:
         for video_index, video_url in enumerate(video_urls, start=1):
-            if download_video(video_url, post_url, media_save_dir, post_budget, video_index):
+            if download_video(video_url, post_url, save_dir, post_budget, video_index):
                 video_saved += 1
-            next_video_index = video_index + 1
-            if post_budget[0] >= MAX_POST_BYTES:
-                break
-
-    # Google Drive 공개 단일 파일 링크를 이미지/영상으로 직접 다운로드한다.
-    # 폴더 링크와 로그인/권한이 필요한 파일은 건너뛴다.
-    if post_budget[0] < MAX_POST_BYTES:
-        for drive_url in google_drive_links[:MAX_EXTERNAL_LINKS_PER_POST]:
-            saved, media_type = download_google_drive_media(
-                drive_url,
-                media_save_dir,
-                post_budget,
-                image_index,
-                next_video_index,
-            )
-            if saved and media_type == "image":
-                image_saved += 1
-                image_index += 1
-            elif saved and media_type == "video":
-                video_saved += 1
-                next_video_index += 1
             if post_budget[0] >= MAX_POST_BYTES:
                 break
 
@@ -547,7 +584,7 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
     if post_budget[0] < MAX_POST_BYTES:
         for external_url in external_links[:MAX_EXTERNAL_LINKS_PER_POST]:
             for image_url in collect_external_page_images(external_url, post_url):
-                if download_image(image_url, external_url, media_save_dir, post_budget, image_index):
+                if download_image(image_url, external_url, save_dir, image_hashes, post_budget, image_index):
                     image_saved += 1
                 image_index += 1
                 if post_budget[0] >= MAX_POST_BYTES:
@@ -556,7 +593,8 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
                 break
 
     logger.info(
-        "게시글 미디어 처리 완료: 새 이미지 %d개, 영상 %d개, %.1f MB",
+        "게시글 %s 미디어 처리 완료: 새 이미지 %d개, 영상 %d개, %.1f MB",
+        post_id,
         image_saved,
         video_saved,
         post_budget[0] / 1024 / 1024,
@@ -564,30 +602,11 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
 
 
 def parse_posts(html: str):
-    """게시글 행을 파싱한다. 디시의 class 순서/추가 class 변화에도 대응한다."""
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", class_="gall_list")
-    if not table:
+    if not table or not table.find("tbody"):
         return []
-    tbody = table.find("tbody")
-    if not tbody:
-        return []
-
-    # 우선 CSS selector로 두 class를 모두 가진 일반 게시글을 찾는다.
-    rows = tbody.select("tr.ub-content.us-post")
-    if rows:
-        return rows
-
-    # fallback: gall_num이 숫자인 ub-content 행을 사용한다.
-    fallback = []
-    for row in tbody.find_all("tr"):
-        classes = set(row.get("class") or [])
-        if "ub-content" not in classes:
-            continue
-        num_cell = row.find("td", class_="gall_num")
-        if num_cell and num_cell.get_text(strip=True).isdecimal():
-            fallback.append(row)
-    return fallback
+    return table.find("tbody").find_all("tr", class_="ub-content us-post")
 
 
 def post_matches(title: str, author: str) -> bool:
@@ -617,21 +636,11 @@ def newest_post_id(rows) -> int:
     return newest
 
 
-STOP_REQUESTED = False
-
-
-def _request_stop(signum, frame):
-    global STOP_REQUESTED
-    STOP_REQUESTED = True
-    logger.info("종료 요청을 받았습니다. 현재 상태를 저장합니다.")
-
-
 def main() -> int:
-    global STOP_REQUESTED
-    signal.signal(signal.SIGINT, _request_stop)
-    signal.signal(signal.SIGTERM, _request_stop)
-
     gallery_type, gallery_id = parse_gallery_url(GALLERY_URL)
+    image_hashes = load_image_hashes()
+    seen_comment_links = load_seen_comment_links()
+
     html = get_html(GALLERY_URL)
     if not html:
         logger.error("초기 갤러리 페이지를 불러오지 못했습니다.")
@@ -640,46 +649,42 @@ def main() -> int:
     rows = parse_posts(html)
     recent = newest_post_id(rows)
     if not recent:
-        logger.error("초기 최신 글 번호를 찾지 못했습니다. 게시판 파싱에 실패했을 수 있습니다.")
+        logger.error("초기 최신 글 번호를 찾지 못했습니다.")
         return 1
 
-    logger.info("감시 시작 (주기 %.1f초, 초기 게시글 %d개 확인)", POLL_SECONDS, len(rows))
+    logger.info("감시 시작 - gallery=%s, 시작 최신 글=%s, 주기=%.1f초", gallery_id, recent, POLL_SECONDS)
     logger.info("이번 실행 예정 시간: %.1f분", MONITOR_SECONDS / 60)
 
     started = time.monotonic()
+    last_comment_check = 0.0
     server_error_count = 0
-    last_heartbeat = started
+    logger.info("댓글 링크 감시: 최근 %d개 글, %.1f초 간격", COMMENT_RECENT_POSTS, COMMENT_POLL_SECONDS)
 
-    while not STOP_REQUESTED and time.monotonic() - started < MONITOR_SECONDS:
+    while time.monotonic() - started < MONITOR_SECONDS:
         loop_started = time.monotonic()
         html = get_html(GALLERY_URL)
         if not html:
             server_error_count += 1
-            wait_seconds = 10 if server_error_count >= 3 else POLL_SECONDS
             if server_error_count >= 3:
-                logger.warning("연속 요청 실패. 잠시 후 계속합니다.")
+                logger.warning("연속 요청 실패. 10초 후 계속합니다.")
+                time.sleep(10)
                 server_error_count = 0
-            stop_at = time.monotonic() + wait_seconds
-            while not STOP_REQUESTED and time.monotonic() < stop_at:
-                time.sleep(min(0.25, stop_at - time.monotonic()))
+            else:
+                time.sleep(POLL_SECONDS)
             continue
         server_error_count = 0
 
         rows = parse_posts(html)
-        if not rows:
-            logger.warning("게시글 목록 파싱 결과가 비어 있습니다. 다음 주기에 다시 시도합니다.")
-            time.sleep(POLL_SECONDS)
-            continue
 
         now = time.monotonic()
-        if now - last_heartbeat >= 60:
-            logger.info("감시 정상 동작 중")
-            last_heartbeat = now
+        if now - last_comment_check >= COMMENT_POLL_SECONDS:
+            check_recent_post_comments(
+                rows, gallery_type, gallery_id, image_hashes, seen_comment_links
+            )
+            last_comment_check = now
 
         highest_seen = recent
         for row in reversed(rows):
-            if STOP_REQUESTED:
-                break
             num_cell = row.find("td", class_="gall_num")
             if not num_cell:
                 continue
@@ -703,42 +708,36 @@ def main() -> int:
                 if subject:
                     title = f"[{subject}] {title}"
 
-            logger.info("새 글 감지")
+            logger.info("새 글 감지: %s | %s | %s", post_id, author, title)
             if not post_matches(title, author):
-                logger.info("키워드 조건 불일치 - 다운로드 생략")
+                logger.info("키워드 조건 불일치 - 다운로드 생략: %s", post_id)
                 continue
 
             post_url = (
                 f"https://gall.dcinside.com{gallery_type}board/view"
                 f"?id={gallery_id}&no={post_id}"
             )
-            download_post_media(post_url, gallery_id, post_id, author)
+            download_post_media(post_url, gallery_id, post_id, author, image_hashes)
 
         recent = highest_seen
 
         elapsed = time.monotonic() - loop_started
         sleep_for = max(0.0, POLL_SECONDS - elapsed)
-        stop_at = time.monotonic() + sleep_for
-        while not STOP_REQUESTED and time.monotonic() < stop_at:
-            time.sleep(min(0.25, stop_at - time.monotonic()))
+        if sleep_for:
+            time.sleep(sleep_for)
 
-    try:
-        tmp_dir = DOWNLOADS_DIR / ".tmp"
-        if tmp_dir.exists() and not any(tmp_dir.iterdir()):
-            tmp_dir.rmdir()
-    except OSError:
-        pass
-
-    if STOP_REQUESTED:
-        logger.info("감시를 중지합니다.")
-    else:
-        logger.info("감시 시간이 끝나 정상 종료합니다.")
+    save_image_hashes(image_hashes)
+    save_seen_comment_links(seen_comment_links)
+    logger.info("감시 시간이 끝나 정상 종료합니다.")
     return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except KeyboardInterrupt:
+        logger.info("사용자 요청으로 종료합니다.")
+        raise SystemExit(0)
     except Exception:
         logger.exception("예상하지 못한 오류로 종료합니다.")
         raise SystemExit(1)
