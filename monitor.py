@@ -41,10 +41,11 @@ MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(20 * 1024 * 1024)))
 MAX_POST_BYTES = int(os.getenv("MAX_POST_BYTES", str(200 * 1024 * 1024)))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "10"))
 
-# 최근 글 댓글 링크 재검사 설정
-COMMENT_RECENT_POSTS = max(1, int(os.getenv("COMMENT_RECENT_POSTS", "20")))
-COMMENT_POLL_SECONDS = min(30.0, max(10.0, float(os.getenv("COMMENT_POLL_SECONDS", "20"))))
+# 새로 감지된 글만 댓글 링크 추적
+COMMENT_POLL_SECONDS = max(1.0, float(os.getenv("COMMENT_POLL_SECONDS", "30")))
+COMMENT_TRACK_SECONDS = max(30, int(os.getenv("COMMENT_TRACK_SECONDS", str(10 * 60))))
 COMMENT_MAX_PAGES = max(1, int(os.getenv("COMMENT_MAX_PAGES", "20")))
+COMMENT_EXCLUDED_EXACT = {"ㅇㅇ", "젖갤러", "젖순이", "가갤러"}
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".avi", ".mkv", ".m4v")
@@ -479,36 +480,44 @@ def process_comment_url(
         image_index[0] += 1
 
 
-def check_recent_post_comments(
-    rows,
+def should_track_comments(author: str) -> bool:
+    """댓글 추적 제외 작성자인지 검사한다."""
+    name = re.sub(r"\s+", " ", str(author)).strip()
+    if name in COMMENT_EXCLUDED_EXACT:
+        return False
+    # 가갤러(123.45), 가갤러 (123.456) 등 유동 IP 표기 제외
+    if re.fullmatch(r"가갤러\s*\(\s*\d+(?:\.\d+)+\s*\)", name):
+        return False
+    return True
+
+
+def check_tracked_post_comments(
+    tracked_posts: dict[int, dict],
     gallery_type: str,
     gallery_id: str,
     image_hashes: set[str],
     seen_comment_links: set[str],
 ) -> None:
-    """목록의 최신 일반글 N개 댓글에서 새 URL만 추적한다."""
-    recent_posts: list[tuple[int, str]] = []
-    for row in rows:
-        num_cell = row.find("td", class_="gall_num")
-        if not num_cell:
-            continue
-        num_text = num_cell.get_text(strip=True)
-        if not num_text.isdecimal():
-            continue
-        post_id = int(num_text)
-        writer_cell = row.find("td", class_="gall_writer")
-        author = writer_cell.get_text(" ", strip=True) if writer_cell else "Unknown"
-        recent_posts.append((post_id, author))
-        if len(recent_posts) >= COMMENT_RECENT_POSTS:
-            break
-
+    """실행 중 새로 감지되어 등록된 글만 최대 10분 동안 30초마다 확인한다."""
+    now = time.monotonic()
     newly_seen = 0
-    for post_id, author in recent_posts:
+
+    for post_id, info in list(tracked_posts.items()):
+        if now >= float(info["expires_at"]):
+            logger.info("댓글 추적 종료(10분 경과): post=%s", post_id)
+            tracked_posts.pop(post_id, None)
+            continue
+        if now < float(info["next_check"]):
+            continue
+
+        # 다음 확인 시각을 먼저 예약해서 요청이 실패해도 즉시 연속 호출하지 않는다.
+        info["next_check"] = now + COMMENT_POLL_SECONDS
+        author = str(info["author"])
         post_url = (
             f"https://gall.dcinside.com{gallery_type}board/view"
             f"?id={gallery_id}&no={post_id}"
         )
-        save_dir = DOWNLOADS_DIR / gallery_id / safe_filename(str(author), "Unknown") / str(post_id)
+        save_dir = DOWNLOADS_DIR / gallery_id / safe_filename(author, "Unknown") / str(post_id)
         links = fetch_comment_links(gallery_id, post_id)
         if not links:
             continue
@@ -532,6 +541,7 @@ def check_recent_post_comments(
     if newly_seen:
         save_seen_comment_links(seen_comment_links)
         logger.info("댓글 링크 %d개 새로 처리", newly_seen)
+
 
 def download_post_media(post_url: str, gallery_id: str, post_id: int, author: str, image_hashes: set[str]):
     html = get_html(post_url)
@@ -682,9 +692,9 @@ def main() -> int:
     logger.info("이번 실행 예정 시간: %.1f분", MONITOR_SECONDS / 60)
 
     started = time.monotonic()
-    last_comment_check = 0.0
+    tracked_comment_posts: dict[int, dict] = {}
     server_error_count = 0
-    logger.info("댓글 링크 감시: 최근 %d개 글, %.1f초 간격", COMMENT_RECENT_POSTS, COMMENT_POLL_SECONDS)
+    logger.info("댓글 링크 감시: 실행 후 새 글만 %.0f분 동안 %.1f초 간격", COMMENT_TRACK_SECONDS / 60, COMMENT_POLL_SECONDS)
 
     while time.monotonic() - started < MONITOR_SECONDS:
         loop_started = time.monotonic()
@@ -702,12 +712,9 @@ def main() -> int:
 
         rows = parse_posts(html)
 
-        now = time.monotonic()
-        if now - last_comment_check >= COMMENT_POLL_SECONDS:
-            check_recent_post_comments(
-                rows, gallery_type, gallery_id, image_hashes, seen_comment_links
-            )
-            last_comment_check = now
+        check_tracked_post_comments(
+            tracked_comment_posts, gallery_type, gallery_id, image_hashes, seen_comment_links
+        )
 
         highest_seen = recent
         for row in reversed(rows):
@@ -744,6 +751,20 @@ def main() -> int:
                 f"?id={gallery_id}&no={post_id}"
             )
             download_post_media(post_url, gallery_id, post_id, author, image_hashes)
+
+            if should_track_comments(author):
+                registered = time.monotonic()
+                tracked_comment_posts[post_id] = {
+                    "author": author,
+                    "expires_at": registered + COMMENT_TRACK_SECONDS,
+                    "next_check": registered + COMMENT_POLL_SECONDS,
+                }
+                logger.info(
+                    "댓글 추적 등록: post=%s author=%s (%.0f분, %.0f초 간격)",
+                    post_id, author, COMMENT_TRACK_SECONDS / 60, COMMENT_POLL_SECONDS,
+                )
+            else:
+                logger.info("댓글 추적 제외 작성자: post=%s author=%s", post_id, author)
 
         recent = highest_seen
 
