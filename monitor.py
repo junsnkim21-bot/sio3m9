@@ -78,7 +78,7 @@ session.headers.update(
 def get_html(url: str, referer: str | None = None):
     headers = {"Referer": referer} if referer else None
     try:
-        resp = session.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        resp = safe_get(url, referer=referer, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
         return resp.text
     except requests.RequestException as exc:
@@ -178,6 +178,38 @@ def is_public_http_url(url: str) -> bool:
     return True
 
 
+
+
+def safe_get(url: str, *, referer: str | None = None, timeout: int | float = HTTP_TIMEOUT, stream: bool = False):
+    """공개 HTTP(S) 주소만 요청하고, 리다이렉트 목적지도 매 단계 다시 검사한다."""
+    current = url
+    headers = {"Referer": referer} if referer else {}
+
+    for _ in range(10):
+        if not is_public_http_url(current):
+            raise requests.RequestException(f"비공개/사설 주소 요청 차단: {current}")
+
+        resp = session.get(
+            current,
+            headers=headers or None,
+            timeout=timeout,
+            stream=stream,
+            allow_redirects=False,
+        )
+
+        if resp.is_redirect or resp.is_permanent_redirect:
+            location = resp.headers.get("Location")
+            if not location:
+                return resp
+            next_url = urljoin(current, location)
+            resp.close()
+            current = next_url
+            continue
+
+        return resp
+
+    raise requests.RequestException("리다이렉트 횟수 제한 초과")
+
 def safe_filename(name: str, fallback: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().strip(".")
     return name or fallback
@@ -220,12 +252,11 @@ def download_image(
 ) -> bool:
     """이미지 저장. 동일 SHA-256이면 새 파일을 삭제한다."""
     try:
-        with session.get(
+        with safe_get(
             image_url,
-            headers={"Referer": referer},
+            referer=referer,
             timeout=HTTP_TIMEOUT,
             stream=True,
-            allow_redirects=True,
         ) as resp:
             resp.raise_for_status()
             content_type = (resp.headers.get("Content-Type") or "").lower()
@@ -278,12 +309,11 @@ def download_image(
 def download_video(video_url: str, referer: str, save_dir: Path, post_budget: list[int], index: int) -> bool:
     """영상은 요청대로 SHA/URL 중복 검사를 하지 않는다."""
     try:
-        with session.get(
+        with safe_get(
             video_url,
-            headers={"Referer": referer},
+            referer=referer,
             timeout=max(HTTP_TIMEOUT, 30),
             stream=True,
-            allow_redirects=True,
         ) as resp:
             resp.raise_for_status()
             content_type = (resp.headers.get("Content-Type") or "").lower()
@@ -331,11 +361,10 @@ def collect_external_page_images(page_url: str, post_url: str) -> list[str]:
         return []
 
     try:
-        resp = session.get(
+        resp = safe_get(
             page_url,
-            headers={"Referer": post_url},
+            referer=post_url,
             timeout=HTTP_TIMEOUT,
-            allow_redirects=True,
         )
         resp.raise_for_status()
         if not is_public_http_url(resp.url):
