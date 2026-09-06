@@ -18,7 +18,9 @@ import re
 import socket
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
@@ -242,6 +244,17 @@ def extension_from_content_type(content_type: str) -> str:
     }.get(content_type, ".jpg")
 
 
+def next_image_path(directory: Path, ext: str) -> Path:
+    """한국 날짜 기준 YYMMDD_image_001.ext 형식의 다음 빈 파일명을 반환한다."""
+    date_prefix = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%y%m%d")
+    index = 1
+    while True:
+        candidate = directory / f"{date_prefix}_image_{index:03d}{ext}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 def download_image(
     image_url: str,
     referer: str,
@@ -272,9 +285,8 @@ def download_image(
             ext = Path(raw_name).suffix.lower()
             if ext not in IMAGE_EXTENSIONS:
                 ext = extension_from_content_type(content_type)
-                raw_name = f"image_{index:03d}{ext}"
 
-            path = unique_path(save_dir, raw_name)
+            path = next_image_path(save_dir, ext)
             written = 0
             with path.open("wb") as f:
                 for chunk in resp.iter_content(chunk_size=1024 * 1024):
@@ -547,7 +559,7 @@ def check_tracked_post_comments(
             f"https://gall.dcinside.com{gallery_type}board/view"
             f"?id={gallery_id}&no={post_id}"
         )
-        save_dir = DOWNLOADS_DIR / gallery_id / safe_filename(author, "Unknown") / str(post_id)
+        save_dir = DOWNLOADS_DIR / gallery_id / safe_filename(author, "Unknown")
         links = fetch_comment_links(gallery_id, post_id)
         if not links:
             continue
@@ -589,8 +601,8 @@ def download_post_media(post_url: str, gallery_id: str, post_id: int, author: st
         return
 
     safe_author = safe_filename(str(author), "Unknown")
-    # 게시글 번호 폴더를 넣어 서로 다른 글의 파일명이 섞이지 않게 한다.
-    save_dir = DOWNLOADS_DIR / gallery_id / safe_author / str(post_id)
+    # 작성자 폴더에 날짜+순번 형식으로 이미지를 저장한다.
+    save_dir = DOWNLOADS_DIR / gallery_id / safe_author
     save_dir.mkdir(parents=True, exist_ok=True)
 
     image_urls: list[str] = []
